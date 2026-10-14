@@ -58,7 +58,7 @@ def init_db():
             );
         """)
     else:
-        cursor.execute("""
+        cursor.executescript("""
             CREATE TABLE IF NOT EXISTS users (
                 phone TEXT PRIMARY KEY,
                 name TEXT,
