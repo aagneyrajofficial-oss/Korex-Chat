@@ -3,7 +3,8 @@ import os
 import time
 import sqlite3
 import google.genai as genai
-from datetime import datetime
+from datetime import datetime, timedelta
+import base64
 
 # Page Configuration
 st.set_page_config(
@@ -15,7 +16,7 @@ st.set_page_config(
 
 GEMINI_API_KEY = "AQ.Ab8RN6JtKg-9BzUbcpA9vAmQrxI4WZl7cfCc0Q2efZ3lyi2kNA"
 
-# ----------------- CLOUD / LOCAL DATABASE ADAPTER -----------------
+# ----------------- DATABASE SETUP -----------------
 USE_POSTGRES = "postgres" in st.secrets and "url" in st.secrets["postgres"]
 
 if USE_POSTGRES:
@@ -46,8 +47,11 @@ def init_db():
                 sender TEXT,
                 receiver TEXT,
                 text TEXT,
+                media_data TEXT,
                 media_type TEXT DEFAULT 'text',
                 time TEXT,
+                timestamp_epoch DOUBLE PRECISION,
+                expire_seconds INTEGER DEFAULT 0,
                 seen INTEGER DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS groups (
@@ -55,6 +59,19 @@ def init_db():
                 group_name TEXT,
                 admin TEXT,
                 members TEXT
+            );
+            CREATE TABLE IF NOT EXISTS communities (
+                id SERIAL PRIMARY KEY,
+                comm_name TEXT,
+                description TEXT,
+                admin TEXT,
+                groups TEXT
+            );
+            CREATE TABLE IF NOT EXISTS chat_wallpapers (
+                user_phone TEXT,
+                chat_target TEXT,
+                wallpaper_data TEXT,
+                PRIMARY KEY (user_phone, chat_target)
             );
         """)
     else:
@@ -73,8 +90,11 @@ def init_db():
                 sender TEXT,
                 receiver TEXT,
                 text TEXT,
+                media_data TEXT,
                 media_type TEXT DEFAULT 'text',
                 time TEXT,
+                timestamp_epoch REAL,
+                expire_seconds INTEGER DEFAULT 0,
                 seen INTEGER DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS groups (
@@ -82,6 +102,19 @@ def init_db():
                 group_name TEXT,
                 admin TEXT,
                 members TEXT
+            );
+            CREATE TABLE IF NOT EXISTS communities (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                comm_name TEXT,
+                description TEXT,
+                admin TEXT,
+                groups TEXT
+            );
+            CREATE TABLE IF NOT EXISTS chat_wallpapers (
+                user_phone TEXT,
+                chat_target TEXT,
+                wallpaper_data TEXT,
+                PRIMARY KEY (user_phone, chat_target)
             );
         """)
     conn.commit()
@@ -98,6 +131,8 @@ if "current_name" not in st.session_state:
     st.session_state.current_name = ""
 if "active_chat" not in st.session_state:
     st.session_state.active_chat = "AI_ASSISTANT"
+if "voice_mode" not in st.session_state:
+    st.session_state.voice_mode = False
 
 # Recover session from URL parameter
 if not st.session_state.logged_in and "session_phone" in st.query_params:
@@ -124,8 +159,46 @@ LOCAL_QA = {
     "hello": "Hello! Welcome to Korex Chat. How can I assist you today?",
     "hi": "Hey there! Ready to chat or explore your features?",
     "who are you": "I am Korex AI, your personal AI companion built straight into your secure chat network.",
-    "features": "Korex Chat features permanent cloud storage, self-chats, group chats, and Korex AI assistant."
+    "features": "Korex Chat features cloud storage, communities, file sharing, disappearing messages, custom photo wallpapers, and Korex AI assistant."
 }
+
+# ----------------- AUDIO & NOTIFICATIONS HELPER -----------------
+def trigger_notification(msg_title, msg_body):
+    sound_html = f"""
+    <audio autoplay style="display:none">
+        <source src="https://assets.mixkit.co/active_storage/sfx/2869/2869-preview.mp3" type="audio/mpeg">
+    </audio>
+    <script>
+        if (Notification.permission === "granted") {{
+            new Notification("{msg_title}", {{ body: "{msg_body}" }});
+        }} else if (Notification.permission !== "denied") {{
+            Notification.requestPermission().then(permission => {{
+                if (permission === "granted") {{
+                    new Notification("{msg_title}", {{ body: "{msg_body}" }});
+                }}
+            }});
+        }}
+    </script>
+    """
+    st.components.v1.html(sound_html, height=0, width=0)
+
+shortcut_listener_html = """
+<script>
+    document.addEventListener('keydown', function(event) {
+        if (event.ctrlKey && event.shiftKey && event.key.toLowerCase() === 'd') {
+            event.preventDefault();
+            const btn = window.parent.document.querySelectorAll('button');
+            for (let b of btn) {
+                if (b.innerText.includes('Voice Mode')) {
+                    b.click();
+                    break;
+                }
+            }
+        }
+    });
+</script>
+"""
+st.components.v1.html(shortcut_listener_html, height=0, width=0)
 
 # ----------------- AUTHENTICATION -----------------
 if not st.session_state.logged_in:
@@ -198,30 +271,47 @@ if not st.session_state.logged_in:
                         st.rerun()
     st.stop()
 
-# ----------------- THEME & WALLPAPER -----------------
-conn = get_db_connection()
-cursor = conn.cursor()
-cursor.execute("SELECT wallpaper FROM users WHERE phone = %s" if USE_POSTGRES else "SELECT wallpaper FROM users WHERE phone = ?", (st.session_state.current_phone,))
-w_res = cursor.fetchone()
-conn.close()
-user_wallpaper = w_res[0] if w_res and w_res[0] else "Dark Classic"
-
-wallpaper_styles = {
-    "Dark Classic": {"bg": "#0b141a", "sidebar": "#111b21", "user": "#005c4b", "bot": "#202c33", "text": "#e9edef", "border": "#222d34"},
-    "Midnight Blue": {"bg": "#09101d", "sidebar": "#101828", "user": "#1e3a8a", "bot": "#1e293b", "text": "#f8fafc", "border": "#334155"},
-    "Emerald Luxe": {"bg": "#022c22", "sidebar": "#064e3b", "user": "#047857", "bot": "#065f46", "text": "#ecfdf5", "border": "#047857"},
-    "Sunset Orange": {"bg": "#1c120f", "sidebar": "#291814", "user": "#9a3412", "bot": "#431407", "text": "#fff7ed", "border": "#572314"},
+# ----------------- WALLPAPER GALLERIES & STYLING -----------------
+preset_wallpapers = {
+    "Nature": {
+        "Forest Mist": "https://images.unsplash.com/photo-1542273917363-3b1817f69a2d?auto=format&fit=crop&w=1200&q=80",
+        "Starry Night": "https://images.unsplash.com/photo-1519681393784-d120267933ba?auto=format&fit=crop&w=1200&q=80",
+        "Ocean Waves": "https://images.unsplash.com/photo-1507525428034-b723cf961d3e?auto=format&fit=crop&w=1200&q=80"
+    },
+    "Anime": {
+        "Cyber City": "https://images.unsplash.com/photo-1578632767115-351597cf2477?auto=format&fit=crop&w=1200&q=80",
+        "Neon Sunset": "https://images.unsplash.com/photo-1534447677768-be436bb09401?auto=format&fit=crop&w=1200&q=80",
+        "Sakura Dreams": "https://images.unsplash.com/photo-1522383225653-ed111181a951?auto=format&fit=crop&w=1200&q=80"
+    },
+    "Classic / Dark": {
+        "Dark Classic": "solid:#0b141a",
+        "Midnight Blue": "solid:#09101d",
+        "Emerald Luxe": "solid:#022c22",
+        "Sunset Orange": "solid:#1c120f"
+    }
 }
 
-active_theme = wallpaper_styles.get(user_wallpaper, wallpaper_styles["Dark Classic"])
+conn = get_db_connection()
+cursor = conn.cursor()
+cursor.execute("SELECT wallpaper_data FROM chat_wallpapers WHERE user_phone = %s AND chat_target = %s" if USE_POSTGRES else "SELECT wallpaper_data FROM chat_wallpapers WHERE user_phone = ? AND chat_target = ?", (st.session_state.current_phone, st.session_state.active_chat))
+wp_res = cursor.fetchone()
+conn.close()
+
+active_wallpaper_url = wp_res[0] if wp_res and wp_res[0] else "solid:#0b141a"
+
+if active_wallpaper_url.startswith("solid:"):
+    bg_color = active_wallpaper_url.split(":")[1]
+    bg_style = f"background-color: {bg_color};"
+else:
+    bg_style = f"background-image: linear-gradient(rgba(0,0,0,0.6), rgba(0,0,0,0.6)), url('{active_wallpaper_url}'); background-size: cover; background-position: center;"
 
 st.markdown(f"""
     <style>
-    .stApp {{ background-color: {active_theme["bg"]}; color: {active_theme["text"]}; }}
-    [data-testid="stSidebar"] {{ background-color: {active_theme["sidebar"]}; border-right: 1px solid {active_theme["border"]}; }}
-    .nexus-header {{ display: flex; align-items: center; background-color: {active_theme["sidebar"]}; padding: 15px 20px; border-bottom: 1px solid {active_theme["border"]}; border-radius: 12px; margin-bottom: 20px; }}
-    .user-msg {{ background-color: {active_theme["user"]}; color: {active_theme["text"]}; padding: 12px 16px; border-radius: 12px 12px 2px 12px; margin-left: auto; max-width: 75%; margin-bottom: 10px; box-shadow: 0 1px 0.5px rgba(0,0,0,0.13); position: relative; }}
-    .bot-msg {{ background-color: {active_theme["bot"]}; color: {active_theme["text"]}; padding: 12px 16px; border-radius: 12px 12px 12px 2px; margin-right: auto; max-width: 75%; margin-bottom: 10px; border: 1px solid {active_theme["border"]}; box-shadow: 0 1px 0.5px rgba(0,0,0,0.13); }}
+    .stApp {{ {bg_style} color: #e9edef; }}
+    [data-testid="stSidebar"] {{ background-color: #111b21; border-right: 1px solid #222d34; }}
+    .nexus-header {{ display: flex; align-items: center; background-color: #111b21; padding: 15px 20px; border-bottom: 1px solid #222d34; border-radius: 12px; margin-bottom: 20px; }}
+    .user-msg {{ background-color: #005c4b; color: #e9edef; padding: 12px 16px; border-radius: 12px 12px 2px 12px; margin-left: auto; max-width: 75%; margin-bottom: 10px; box-shadow: 0 1px 0.5px rgba(0,0,0,0.13); position: relative; }}
+    .bot-msg {{ background-color: #202c33; color: #e9edef; padding: 12px 16px; border-radius: 12px 12px 12px 2px; margin-right: auto; max-width: 75%; margin-bottom: 10px; border: 1px solid #222d34; box-shadow: 0 1px 0.5px rgba(0,0,0,0.13); }}
     .msg-meta {{ font-size: 0.7em; color: #8696a0; text-align: right; margin-top: 4px; }}
     </style>
 """, unsafe_allow_html=True)
@@ -245,14 +335,54 @@ with st.sidebar:
                 time.sleep(0.3)
                 st.rerun()
 
-        selected_wp = st.selectbox("Wallpaper Theme", list(wallpaper_styles.keys()), index=list(wallpaper_styles.keys()).index(user_wallpaper))
-        if selected_wp != user_wallpaper:
+        st.subheader("Customize Current Chat Wallpaper")
+        wp_category = st.selectbox("Category", list(preset_wallpapers.keys()))
+        wp_choice = st.selectbox("Preset Wallpapers", list(preset_wallpapers[wp_category].keys()))
+        
+        if st.button("Apply Preset Wallpaper"):
+            selected_url = preset_wallpapers[wp_category][wp_choice]
             conn = get_db_connection()
             cursor = conn.cursor()
-            cursor.execute("UPDATE users SET wallpaper = %s WHERE phone = %s" if USE_POSTGRES else "UPDATE users SET wallpaper = ? WHERE phone = ?", (selected_wp, st.session_state.current_phone))
+            if USE_POSTGRES:
+                cursor.execute("""
+                    INSERT INTO chat_wallpapers (user_phone, chat_target, wallpaper_data) VALUES (%s, %s, %s)
+                    ON CONFLICT (user_phone, chat_target) DO UPDATE SET wallpaper_data = EXCLUDED.wallpaper_data
+                """, (st.session_state.current_phone, st.session_state.active_chat, selected_url))
+            else:
+                cursor.execute("""
+                    INSERT OR REPLACE INTO chat_wallpapers (user_phone, chat_target, wallpaper_data) VALUES (?, ?, ?)
+                """, (st.session_state.current_phone, st.session_state.active_chat, selected_url))
             conn.commit()
             conn.close()
+            st.success("Wallpaper updated!")
             st.rerun()
+
+        st.markdown("---")
+        custom_file = st.file_uploader("Upload Custom Image", type=["jpg", "png", "jpeg"])
+        if custom_file is not None:
+            image_bytes = custom_file.read()
+            encoded_img = base64.b64encode(image_bytes).decode("utf-8")
+            custom_data_url = f"data:image/jpeg;base64,{encoded_img}"
+            
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            if USE_POSTGRES:
+                cursor.execute("""
+                    INSERT INTO chat_wallpapers (user_phone, chat_target, wallpaper_data) VALUES (%s, %s, %s)
+                    ON CONFLICT (user_phone, chat_target) DO UPDATE SET wallpaper_data = EXCLUDED.wallpaper_data
+                """, (st.session_state.current_phone, st.session_state.active_chat, custom_data_url))
+            else:
+                cursor.execute("""
+                    INSERT OR REPLACE INTO chat_wallpapers (user_phone, chat_target, wallpaper_data) VALUES (?, ?, ?)
+                """, (st.session_state.current_phone, st.session_state.active_chat, custom_data_url))
+            conn.commit()
+            conn.close()
+            st.success("Custom wallpaper applied!")
+            st.rerun()
+
+        st.markdown("---")
+        st.subheader("Disappearing Messages")
+        disappearing_option = st.selectbox("Timer", ["Off", "1 Minute", "1 Hour", "24 Hours"], key="disappearing_timer")
 
     if st.button("Log Out", use_container_width=True):
         if "session_phone" in st.query_params:
@@ -261,8 +391,8 @@ with st.sidebar:
         st.rerun()
 
     st.markdown("---")
-    st.subheader("Add Contact / Group")
-    add_tab1, add_tab2 = st.tabs(["Contact", "Group"])
+    st.subheader("Add Contact / Group / Community")
+    add_tab1, add_tab2, add_tab3 = st.tabs(["Contact", "Group", "Community"])
     
     with add_tab1:
         search_number = st.text_input("Mobile Number:", placeholder="e.g., 1111111111", label_visibility="collapsed").strip()
@@ -307,17 +437,29 @@ with st.sidebar:
                 time.sleep(0.3)
                 st.rerun()
 
+    with add_tab3:
+        c_name = st.text_input("Community Name", placeholder="e.g., Tech Hub").strip()
+        c_desc = st.text_input("Description", placeholder="e.g., Global Developer Discussions").strip()
+        if st.button("Create Community", use_container_width=True):
+            if c_name:
+                conn = get_db_connection()
+                cursor = conn.cursor()
+                cursor.execute("INSERT INTO communities (comm_name, description, admin, groups) VALUES (%s, %s, %s, %s)" if USE_POSTGRES else "INSERT INTO communities (comm_name, description, admin, groups) VALUES (?, ?, ?, ?)", (c_name, c_desc, st.session_state.current_phone, ""))
+                conn.commit()
+                conn.close()
+                st.success(f"Community '{c_name}' created!")
+                time.sleep(0.3)
+                st.rerun()
+
     st.markdown("---")
     chat_search = st.text_input("Search chats...", placeholder="Type to search...", label_visibility="collapsed").strip().lower()
     st.markdown("### Conversations")
     
-    # AI Assistant Conversation
     if not chat_search or "ai" in chat_search or "korex" in chat_search:
         if st.button("Korex AI Assistant", key="chat_ai", use_container_width=True):
             st.session_state.active_chat = "AI_ASSISTANT"
             st.rerun()
 
-    # Own Chat / Saved Messages (Self-Chat)
     if not chat_search or "saved" in chat_search or "note" in chat_search or st.session_state.current_phone.lower() in chat_search:
         self_key = f"SELF_{st.session_state.current_phone}"
         if st.button(f"{st.session_state.current_name} (You / Saved Messages)", key="chat_self", use_container_width=True):
@@ -326,6 +468,15 @@ with st.sidebar:
 
     conn = get_db_connection()
     cursor = conn.cursor()
+
+    # Communities
+    cursor.execute("SELECT id, comm_name FROM communities")
+    for comm_id, comm_name in cursor.fetchall():
+        if not chat_search or chat_search in comm_name.lower():
+            c_key = f"COMM_{comm_id}"
+            if st.button(f"Community: {comm_name}", key=f"comm_{comm_id}", use_container_width=True):
+                st.session_state.active_chat = c_key
+                st.rerun()
 
     # Groups
     cursor.execute("SELECT id, group_name, members FROM groups")
@@ -354,12 +505,20 @@ with st.sidebar:
                         st.rerun()
     conn.close()
 
-# ----------------- CHAT HEADER -----------------
+# ----------------- CHAT HEADER & VOICE CONTROLS -----------------
 active_chat_title = "Chat"
 if st.session_state.active_chat == "AI_ASSISTANT":
     active_chat_title = "Korex AI"
 elif st.session_state.active_chat.startswith("SELF_"):
     active_chat_title = f"Saved Messages ({st.session_state.current_name})"
+elif st.session_state.active_chat.startswith("COMM_"):
+    c_id = st.session_state.active_chat.split("_")[1]
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT comm_name FROM communities WHERE id = %s" if USE_POSTGRES else "SELECT comm_name FROM communities WHERE id = ?", (c_id,))
+    c_res = cursor.fetchone()
+    conn.close()
+    active_chat_title = f"Community: {c_res[0] if c_res else 'Community'}"
 elif st.session_state.active_chat.startswith("GROUP_"):
     g_id = st.session_state.active_chat.split("_")[1]
     conn = get_db_connection()
@@ -376,14 +535,24 @@ else:
     conn.close()
     active_chat_title = t_res[0] if t_res else "Chat"
 
-st.markdown(f"""
-    <div class="nexus-header">
-        <div>
-            <h2 style="margin: 0; padding: 0;">{active_chat_title}</h2>
-            <span style="font-size: 0.85em; color: #00a884;">End-to-End Encrypted Cloud Workspace</span>
+col_h1, col_h2 = st.columns([5, 1])
+with col_h1:
+    st.markdown(f"""
+        <div class="nexus-header">
+            <div>
+                <h2 style="margin: 0; padding: 0;">{active_chat_title}</h2>
+                <span style="font-size: 0.85em; color: #00a884;">End-to-End Encrypted Cloud Workspace</span>
+            </div>
         </div>
-    </div>
-""", unsafe_allow_html=True)
+    """, unsafe_allow_html=True)
+
+with col_h2:
+    if st.button("Voice Mode (Ctrl+Shift+D)", use_container_width=True):
+        st.session_state.voice_mode = not st.session_state.voice_mode
+        st.rerun()
+
+if st.session_state.voice_mode:
+    st.info("🎙️ Voice Mode Active: Speak your thoughts or listen to responses.")
 
 tab_chat, tab_calls, tab_status = st.tabs(["Chat & Media", "Voice & Video Calls", "Status Feed"])
 
@@ -409,12 +578,14 @@ with tab_chat:
             else:
                 with st.spinner("Korex AI is thinking..."):
                     try:
-                        client = genai.Client(api_key=GEMINI_API_KEY)
+                        os.environ["GEMINI_API_KEY"] = GEMINI_API_KEY
+                        client = genai.Client()
                         res = client.models.generate_content(model="gemini-2.5-flash", contents=user_prompt)
                         final_answer = res.text
                     except Exception as err:
                         final_answer = f"Error: {str(err)}"
             st.session_state.ai_chats.append({"role": "assistant", "content": final_answer})
+            trigger_notification("Korex AI", "New message response received.")
             st.rerun()
 
     else:
@@ -422,38 +593,88 @@ with tab_chat:
         if target_receiver.startswith("SELF_"):
             target_receiver = st.session_state.current_phone
 
+        # Clean up expired disappearing messages first
         conn = get_db_connection()
         cursor = conn.cursor()
+        current_epoch = time.time()
+        cursor.execute("DELETE FROM messages WHERE expire_seconds > 0 AND (timestamp_epoch + expire_seconds) < %s" if USE_POSTGRES else "DELETE FROM messages WHERE expire_seconds > 0 AND (timestamp_epoch + expire_seconds) < ?", (current_epoch,))
+        conn.commit()
+
+        # Fetch messages
         cursor.execute("""
-            SELECT id, sender, text, media_type, time, seen FROM messages 
+            SELECT id, sender, text, media_data, media_type, time, seen FROM messages 
             WHERE (sender = %s AND receiver = %s) OR (sender = %s AND receiver = %s)
             ORDER BY id ASC
         """ if USE_POSTGRES else """
-            SELECT id, sender, text, media_type, time, seen FROM messages 
+            SELECT id, sender, text, media_data, media_type, time, seen FROM messages 
             WHERE (sender = ? AND receiver = ?) OR (sender = ? AND receiver = ?)
             ORDER BY id ASC
         """, (st.session_state.current_phone, target_receiver, target_receiver, st.session_state.current_phone))
         room_messages = cursor.fetchall()
         conn.close()
 
-        for msg_id, sender, text, media_type, timestamp, seen in room_messages:
+        for msg_id, sender, text, media_data, media_type, timestamp, seen in room_messages:
             ticks = '<span style="color: #34b7f1;">✓✓</span>' if seen == 1 else '<span style="color: #8696a0;">✓</span>'
-            if sender == st.session_state.current_phone:
-                st.markdown(f'<div class="user-msg">{text}<div class="msg-meta">{timestamp} &nbsp; {ticks}</div></div>', unsafe_allow_html=True)
-            else:
-                st.markdown(f'<div class="bot-msg"><b>{sender}:</b><br>{text}<div class="msg-meta">{timestamp}</div></div>', unsafe_allow_html=True)
+            
+            content_display = text if text else ""
+            if media_type == "image" and media_data:
+                content_display += f"<br><img src='{media_data}' style='max-width: 250px; border-radius: 8px; margin-top: 5px;'/>"
+            elif media_type == "file" and media_data:
+                content_display += f"<br>📁 <em>Attached File</em>"
 
-        if peer_prompt := st.chat_input(f"Message {active_chat_title}..."):
+            if sender == st.session_state.current_phone:
+                st.markdown(f'<div class="user-msg">{content_display}<div class="msg-meta">{timestamp} &nbsp; {ticks}</div></div>', unsafe_allow_html=True)
+            else:
+                st.markdown(f'<div class="bot-msg"><b>{sender}:</b><br>{content_display}<div class="msg-meta">{timestamp}</div></div>', unsafe_allow_html=True)
+
+        # Chat Input with File Attachment Support
+        user_input = st.chat_input("Message or attach file...", accept_file=True, file_type=["jpg", "png", "jpeg", "pdf", "txt"])
+        
+        if user_input:
+            msg_text = user_input.text if hasattr(user_input, "text") else str(user_input)
+            uploaded_files = user_input.files if hasattr(user_input, "files") and user_input.files else []
+            
             timestamp = datetime.now().strftime("%H:%M")
+            timestamp_epoch = time.time()
+            
+            expire_sec = 0
+            timer_setting = st.session_state.get("disappearing_timer", "Off")
+            if timer_setting == "1 Minute":
+                expire_sec = 60
+            elif timer_setting == "1 Hour":
+                expire_sec = 3600
+            elif timer_setting == "24 Hours":
+                expire_sec = 86400
+
             conn = get_db_connection()
             cursor = conn.cursor()
-            cursor.execute("""
-                INSERT INTO messages (sender, receiver, text, time, seen) VALUES (%s, %s, %s, %s, 0)
-            """ if USE_POSTGRES else """
-                INSERT INTO messages (sender, receiver, text, time, seen) VALUES (?, ?, ?, ?, 0)
-            """, (st.session_state.current_phone, target_receiver, peer_prompt, timestamp))
+
+            if uploaded_files:
+                for f in uploaded_files:
+                    f_bytes = f.read()
+                    f_b64 = base64.b64encode(f_bytes).decode("utf-8")
+                    f_type = "image" if f.type.startswith("image") else "file"
+                    f_data_url = f"data:{f.type};base64,{f_b64}"
+                    
+                    cursor.execute("""
+                        INSERT INTO messages (sender, receiver, text, media_data, media_type, time, timestamp_epoch, expire_seconds, seen) 
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 0)
+                    """ if USE_POSTGRES else """
+                        INSERT INTO messages (sender, receiver, text, media_data, media_type, time, timestamp_epoch, expire_seconds, seen) 
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
+                    """, (st.session_state.current_phone, target_receiver, msg_text, f_data_url, f_type, timestamp, timestamp_epoch, expire_sec))
+            elif msg_text.strip():
+                cursor.execute("""
+                    INSERT INTO messages (sender, receiver, text, media_data, media_type, time, timestamp_epoch, expire_seconds, seen) 
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 0)
+                """ if USE_POSTGRES else """
+                    INSERT INTO messages (sender, receiver, text, media_data, media_type, time, timestamp_epoch, expire_seconds, seen) 
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
+                """, (st.session_state.current_phone, target_receiver, msg_text, "", "text", timestamp, timestamp_epoch, expire_sec))
+
             conn.commit()
             conn.close()
+            trigger_notification("Korex Chat", f"New message from {st.session_state.current_name}")
             st.rerun()
 
 # --- TAB 2: CALLS ---
