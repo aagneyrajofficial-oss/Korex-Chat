@@ -593,11 +593,15 @@ with tab_chat:
         if target_receiver.startswith("SELF_"):
             target_receiver = st.session_state.current_phone
 
-        # Clean up expired disappearing messages first
+        # Clean up expired disappearing messages safely using adapter placeholders
         conn = get_db_connection()
         cursor = conn.cursor()
         current_epoch = time.time()
-        cursor.execute("DELETE FROM messages WHERE expire_seconds > 0 AND (timestamp_epoch + expire_seconds) < %s" if USE_POSTGRES else "DELETE FROM messages WHERE expire_seconds > 0 AND (timestamp_epoch + expire_seconds) < ?", (current_epoch,))
+        
+        if USE_POSTGRES:
+            cursor.execute("DELETE FROM messages WHERE expire_seconds > 0 AND (timestamp_epoch + expire_seconds) < %s", (current_epoch,))
+        else:
+            cursor.execute("DELETE FROM messages WHERE expire_seconds > 0 AND (timestamp_epoch + expire_seconds) < ?", (current_epoch,))
         conn.commit()
 
         # Fetch messages
